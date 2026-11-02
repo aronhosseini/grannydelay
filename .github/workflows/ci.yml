@@ -1,0 +1,164 @@
+name: Build Granny Delay
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  release:
+    types: [ created ]
+  workflow_dispatch:
+
+env:
+  JUCE_VERSION: "7.0.12"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get JUCE
+        shell: bash
+        run: git clone --depth 1 --branch "$JUCE_VERSION" https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure (MSVC)
+        run: cmake -S . -B build -A x64 -DJUCE_PATH="${{ github.workspace }}/JUCE"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect VST3
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $vst3 = Get-ChildItem -Path build -Recurse -Directory -Filter "GrannyDelay.vst3" | Select-Object -First 1
+          if (-not $vst3) { throw "GrannyDelay.vst3 was not built" }
+          Copy-Item -Recurse -Force $vst3.FullName dist/GrannyDelay.vst3
+          Compress-Archive -Path dist/GrannyDelay.vst3 -DestinationPath dist/GrannyDelay-Windows-VST3.zip -Force
+
+      - name: Build Windows installer (NSIS)
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          & "C:\Program Files (x86)\NSIS\makensis.exe" "/DVST3_DIR=${{ github.workspace }}\dist\GrannyDelay.vst3" "/DOUT_DIR=${{ github.workspace }}\dist" "/DLICENSE_FILE=${{ github.workspace }}\LICENSE" installers/windows/GrannyDelay.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          if (-not (Test-Path dist/GrannyDelay-Setup.exe)) { throw "GrannyDelay-Setup.exe was not created" }
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GrannyDelay-Windows
+          path: |
+            dist/GrannyDelay-Setup.exe
+            dist/GrannyDelay-Windows-VST3.zip
+          if-no-files-found: error
+
+  build-mac:
+    runs-on: macos-latest
+    env:
+      # JUCE 7's helper tool (juceaide) otherwise targets the newest SDK, where CGWindowListCreateImage is obsolete
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+      # Optional: set these repository secrets for a fully signed + notarized installer (needs Apple Developer ID).
+      # Without them the plugins are ad-hoc signed and the install.sh / Homebrew routes avoid Gatekeeper prompts.
+      APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      APPLE_APP_IDENTITY: ${{ secrets.APPLE_APP_IDENTITY }}
+      APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get JUCE
+        run: git clone --depth 1 --branch "$JUCE_VERSION" https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure
+        run: |
+          configure() {
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 -DJUCE_PATH="$GITHUB_WORKSPACE/JUCE"
+          }
+          if ! configure; then
+            echo "::warning::JUCE $JUCE_VERSION failed to configure with this macOS SDK - retrying with a newer JUCE"
+            rm -rf build JUCE
+            for tag in 8.0.12 8.0.10 8.0.8; do
+              if git clone --depth 1 --branch "$tag" https://github.com/juce-framework/JUCE.git JUCE; then
+                echo "Using JUCE $tag"
+                break
+              fi
+            done
+            configure
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Import Developer ID certificates (optional)
+        if: env.APPLE_CERT_P12 != ''
+        run: |
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci-keychain build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci-keychain build.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci-keychain build.keychain
+
+      - name: Collect plugins
+        run: |
+          mkdir -p dist
+          VST3=$(find build -name "GrannyDelay.vst3" -type d | head -1)
+          [ -n "$VST3" ] || { echo "GrannyDelay.vst3 was not built"; exit 1; }
+          cp -R "$VST3" dist/
+          AU=$(find build -name "GrannyDelay.component" -type d | head -1)
+          if [ -n "$AU" ]; then cp -R "$AU" dist/; fi
+
+      - name: Sign, zip, build .pkg and .dmg
+        env:
+          GD_REPO: ${{ github.repository }}
+        run: |
+          export GD_VERSION="$(echo "${TAG:-1.0.0}" | sed 's/^v//')"
+          bash installers/mac/build-pkg.sh dist
+
+      - name: Generate install.sh and Homebrew cask
+        run: bash installers/mac/make-release-files.sh "${{ github.repository }}" "${TAG}" dist
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GrannyDelay-macOS
+          path: |
+            dist/GrannyDelay-macOS.zip
+            dist/GrannyDelay-macOS.pkg
+            dist/GrannyDelay-macOS.dmg
+            dist/install.sh
+            dist/granny-delay.rb
+          if-no-files-found: error
+
+  create-release:
+    needs: [ build-windows, build-mac ]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: GrannyDelay-Windows
+          path: artifacts/windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: GrannyDelay-macOS
+          path: artifacts/mac
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows/*
+            artifacts/mac/*
